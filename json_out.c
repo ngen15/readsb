@@ -869,6 +869,7 @@ char *sprintAircraftRecent(char *p, char *end, struct aircraft *a, int64_t now, 
     }
     if (recent > trackDataAge(now, &a->baro_alt_valid))
         p = safe_snprintf(p, end, ",\"alt_baro\":%d", a->baro_alt);
+        p = safe_snprintf(p, end, ",\"ground\":false");
     if (recent > trackDataAge(now, &a->geom_alt_valid))
         p = safe_snprintf(p, end, ",\"alt_geom\":%d", a->geom_alt);
     if (recent > trackDataAge(now, &a->gs_valid))

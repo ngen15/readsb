@@ -673,8 +673,6 @@ char *sprintAircraftObject(char *p, char *end, struct aircraft *a, int64_t now, 
         if (trackDataValid(&a->airground_valid) && a->airground == AG_GROUND) {
             if (0)
                 p = safe_snprintf(p, end, ",\"ground\":true");
-            else
-                p = safe_snprintf(p, end, ",\"alt_baro\":\"ground\"");
         } else {
             if (altBaroReliable(a))
                 p = safe_snprintf(p, end, ",\"alt_baro\":%d", a->baro_alt);

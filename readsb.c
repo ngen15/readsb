@@ -121,8 +121,12 @@ static void configSetDefaults(void) {
     Modes.net_heartbeat_interval = MODES_NET_HEARTBEAT_INTERVAL;
     //Modes.db_file = strdup("/usr/local/share/tar1090/git-db/aircraft.csv.gz");
     Modes.db_file = NULL;
+    Modes.latString = strdup("");
+    Modes.lonString = strdup("");
     Modes.net_input_raw_ports = strdup("0");
     Modes.net_output_raw_ports = strdup("0");
+    Modes.net_output_uat_replay_ports = strdup("0");
+    Modes.net_input_uat_ports = strdup("0");
     Modes.net_output_sbs_ports = strdup("0");
     Modes.net_input_sbs_ports = strdup("0");
     Modes.net_input_beast_ports = strdup("0");
@@ -149,15 +153,22 @@ static void configSetDefaults(void) {
     Modes.net_sndbuf_size = 2; // Default to 256 kB SNDBUF / RCVBUF
     Modes.net_output_flush_size = 1280; // Default to 1280 Bytes
     Modes.net_output_flush_interval = 50; // Default to 50 ms
+    Modes.net_output_flush_interval_beast_reduce = -1; // default to net_output_flush_interval after config parse if not configured
     Modes.netReceiverId = 0;
     Modes.netIngest = 0;
     Modes.uuidFile = strdup("/usr/local/share/adsbexchange/adsbx-uuid");
     Modes.json_trace_interval = 20 * 1000;
+    Modes.state_write_interval = 1 * HOURS;
     Modes.heatmap_current_interval = -15;
     Modes.heatmap_interval = 60 * SECONDS;
     Modes.json_reliable = -13;
     Modes.acasFD1 = -1; // set to -1 so it's clear we don't have that fd
     Modes.acasFD2 = -1; // set to -1 so it's clear we don't have that fd
+    Modes.sbsOverrideSquawk = -1;
+
+    Modes.fUserAlt = -2e6;
+
+    Modes.enable_zstd = 1;
 
     Modes.currentTask = "unset";
     Modes.joinTimeout = 30 * SECONDS;
@@ -223,7 +234,7 @@ static void configSetDefaults(void) {
     Modes.ping_reduce = PING_REDUCE;
     Modes.ping_reject = PING_REJECT;
 
-    Modes.binCraftVersion = 20220916;
+    Modes.binCraftVersion = 20240218;
     Modes.messageRateMult = 1.0f;
 
     Modes.apiShutdownDelay = 0 * SECONDS;
@@ -243,6 +254,7 @@ static void modesInit(void) {
 
     pthread_mutex_init(&Modes.traceDebugMutex, NULL);
     pthread_mutex_init(&Modes.hungTimerMutex, NULL);
+    pthread_mutex_init(&Modes.sdrControlMutex, NULL);
 
     threadInit(&Threads.reader, "reader");
     threadInit(&Threads.upkeep, "upkeep");
@@ -444,8 +456,8 @@ void priorityTasksRun() {
         antiSpam = mono;
     }
 
-    //fprintf(stderr, "running for %ld ms\n", mstime() - Modes.startup_time);
-    //fprintf(stderr, "removeStale took %"PRIu64" ms, running for %ld ms\n", elapsed, now - Modes.startup_time);
+    //fprintf(stderr, "running for %ld ms\n", getUptime());
+    //fprintf(stderr, "removeStale took %"PRIu64" ms, running for %ld ms\n", elapsed, getUptime());
 
     if (Modes.updateStats) {
         Modes.currentTask = "statsReset";
@@ -487,10 +499,13 @@ static void *readerEntryPoint(void *arg) {
     srandom(get_seed());
 
     if (!sdrOpen()) {
+        Modes.sdrOpenFailed = 1;
         setExit(2); // unexpected exit
         log_with_timestamp("sdrOpen() failed, exiting!");
         return NULL;
     }
+
+    setPriorityPthread();
 
     if (sdrHasRun()) {
         sdrRun();
@@ -518,6 +533,9 @@ static void *jsonEntryPoint(void *arg) {
     MODES_NOTUSED(arg);
     srandom(get_seed());
 
+    // set this thread low priority
+    setLowestPriorityPthread();
+
     int64_t next_history = mstime();
 
     struct timespec ts;
@@ -528,7 +546,12 @@ static void *jsonEntryPoint(void *arg) {
     threadpool_buffer_t pass_buffer = { 0 };
     threadpool_buffer_t zstd_buffer = { 0 };
 
-    ZSTD_CCtx* cctx = ZSTD_createCCtx();
+    ZSTD_CCtx* cctx = NULL;
+    if (Modes.enable_zstd) {
+        //if (Modes.debug_zstd) { fprintf(stderr, "calling ZSTD_createCCtx()\n"); }
+        cctx = ZSTD_createCCtx();
+        //if (Modes.debug_zstd) { fprintf(stderr, "ZSTD_createCCtx() returned %p\n", cctx); }
+    }
 
     while (!Modes.exit) {
 
@@ -548,7 +571,7 @@ static void *jsonEntryPoint(void *arg) {
             }
             writeJsonToFile(Modes.json_dir, "aircraft.json", cb);
 
-            if ((ALL_JSON) && Modes.onlyBin < 2 && now >= next_history) {
+            if ((Modes.legacy_history || ((ALL_JSON) && Modes.onlyBin < 2)) && now >= next_history) {
                 char filebuf[PATH_MAX];
 
                 snprintf(filebuf, PATH_MAX, "history_%d.json", Modes.json_aircraft_history_next);
@@ -578,17 +601,24 @@ static void *jsonEntryPoint(void *arg) {
         }
 
         //fprintf(stderr, "uncompressed size %ld\n", (long) cb3.len);
-        writeJsonToFile(Modes.json_dir, "aircraft.binCraft.zst", generateZstd(cctx, &zstd_buffer, cb3, 1));
+        if (Modes.enable_zstd) {
+            writeJsonToFile(Modes.json_dir, "aircraft.binCraft.zst", generateZstd(cctx, &zstd_buffer, cb3, 1));
+        }
 
         if (Modes.json_globe_index) {
             struct char_buffer cb2 = generateGlobeBin(-1, 1, &pass_buffer);
             if (Modes.enableBinGz) {
                 writeJsonToGzip(Modes.json_dir, "globeMil_42777.binCraft", cb2, 1);
             }
-            writeJsonToFile(Modes.json_dir, "globeMil_42777.binCraft.zst", ident(generateZstd(cctx, &zstd_buffer, cb2, 1)));
+            if (Modes.enable_zstd) {
+                writeJsonToFile(Modes.json_dir, "globeMil_42777.binCraft.zst", ident(generateZstd(cctx, &zstd_buffer, cb2, 1)));
+            }
         }
 
         end_cpu_timing(&start_time, &Modes.stats_current.aircraft_json_cpu);
+
+        //fprintTimePrecise(stderr, mstime());
+        //fprintf(stderr, " wrote --write-json-every stuff to --write-json \n");
 
         // we should exit this wait early due to a cond_signal from api.c
         threadTimedWait(&Threads.json, &ts, Modes.json_interval * 3);
@@ -606,6 +636,9 @@ static void *jsonEntryPoint(void *arg) {
 static void *globeJsonEntryPoint(void *arg) {
     MODES_NOTUSED(arg);
     srandom(get_seed());
+
+    // set this thread low priority
+    setLowestPriorityPthread();
 
     if (Modes.onlyBin > 0)
         return NULL;
@@ -645,6 +678,9 @@ static void *globeBinEntryPoint(void *arg) {
     MODES_NOTUSED(arg);
     srandom(get_seed());
 
+    // set this thread low priority
+    setLowestPriorityPthread();
+
     int part = 0;
     int n_parts = 8; // power of 2
 
@@ -655,7 +691,10 @@ static void *globeBinEntryPoint(void *arg) {
     threadpool_buffer_t pass_buffer = { 0 };
     threadpool_buffer_t zstd_buffer = { 0 };
 
-    ZSTD_CCtx* cctx = ZSTD_createCCtx();
+    ZSTD_CCtx* cctx = NULL;
+    if (Modes.enable_zstd) {
+        cctx = ZSTD_createCCtx();
+    }
 
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -678,8 +717,10 @@ static void *globeBinEntryPoint(void *arg) {
                 writeJsonToGzip(Modes.json_dir, filename, cb2, 1);
             }
 
-            snprintf(filename, 31, "globe_%04d.binCraft.zst", index);
-            writeJsonToFile(Modes.json_dir, filename, ident(generateZstd(cctx, &zstd_buffer, cb2, 1)));
+            if (Modes.enable_zstd) {
+                snprintf(filename, 31, "globe_%04d.binCraft.zst", index);
+                writeJsonToFile(Modes.json_dir, filename, ident(generateZstd(cctx, &zstd_buffer, cb2, 1)));
+            }
 
             struct char_buffer cb3 = generateGlobeBin(index, 1, &pass_buffer);
 
@@ -688,8 +729,10 @@ static void *globeBinEntryPoint(void *arg) {
                 writeJsonToGzip(Modes.json_dir, filename, cb3, 1);
             }
 
-            snprintf(filename, 31, "globeMil_%04d.binCraft.zst", index);
-            writeJsonToFile(Modes.json_dir, filename, ident(generateZstd(cctx, &zstd_buffer, cb3, 1)));
+            if (Modes.enable_zstd) {
+                snprintf(filename, 31, "globeMil_%04d.binCraft.zst", index);
+                writeJsonToFile(Modes.json_dir, filename, ident(generateZstd(cctx, &zstd_buffer, cb3, 1)));
+            }
         }
 
         part++;
@@ -709,59 +752,60 @@ static void *globeBinEntryPoint(void *arg) {
 }
 
 static void timingStatistics(struct mag_buf *buf) {
-    if (0) {
-        static int64_t last;
+    static int64_t last_ts;
 
-        double elapsed = buf->sysMicroseconds - last;
-        last = buf->sysMicroseconds;
+    int64_t elapsed_ts = buf->sysMicroseconds - last_ts;
 
-        static double last_elapsed;
-        // diff more than 2 ms:
-        if (fabs(elapsed - last_elapsed) > 200) {
-            fprintf(stderr, "time between USB transfers: %.0f us\n", elapsed);
-            last_elapsed = elapsed;
-        }
+    // nominal time in us between two SDR callbacks
+    int64_t nominal = Modes.sdr_buf_samples * 1000LL * 1000LL / Modes.sample_rate;
+
+    int64_t jitter = elapsed_ts - nominal;
+    if (last_ts && Modes.log_usb_jitter && fabs((double)jitter) > Modes.log_usb_jitter) {
+        fprintf(stderr, "libusb callback jitter: %6.0f us\n", (double) jitter);
     }
 
-    {
-        static int64_t last_sys;
+    static int64_t last_sys;
+    if (last_sys || buf->sampleTimestamp * (1 / 12e6) > 10) {
         static int64_t last_sample;
+        static int64_t interval;
+        int64_t nominal_interval = 30 * SECONDS * 1000;
         if (!last_sys) {
             last_sys = buf->sysMicroseconds;
             last_sample = buf->sampleTimestamp;
+            interval = nominal_interval;
         }
         double elapsed_sys = buf->sysMicroseconds - last_sys;
-        if (elapsed_sys > 30 * SECONDS * 1000) {
+        // every 30 seconds
+        if ((elapsed_sys > interval && fabs((double) jitter) < 100) || elapsed_sys > interval * 3 / 2) {
+            // adjust interval heuristically
+            interval += (nominal_interval - elapsed_sys) / 4;
             double elapsed_sample = buf->sampleTimestamp - last_sample;
             double freq_ratio = elapsed_sample / (elapsed_sys * 12.0);
-            double diff_us = elapsed_sys - elapsed_sample / 12.0;
+            double diff_us = elapsed_sample / 12.0 - elapsed_sys;
             double ppm = (freq_ratio - 1) * 1e6;
-            // ignore the first 30 seconds for alerting purposes
-            if (last_sample != 0) {
-                Modes.estimated_ppm = ppm;
-                if (fabs(ppm) > 600) {
-                    if (ppm < -1000) {
-                        int packets_lost = (int) nearbyint(ppm / -1820);
-                        Modes.stats_current.samples_lost += packets_lost * Modes.sdr_buf_samples;
-                        fprintf(stderr, "Lost %d packets (%.1f us) on USB, MLAT could be UNSTABLE, check sync! (ppm: %.0f)"
-                                "(or the system clock jumped for some reason)\n", packets_lost, diff_us, ppm);
-                    } else {
-                        fprintf(stderr, "SDR ppm out of specification (could cause MLAT issues) or local clock jumped / not syncing with ntp or chrony! ppm: %.0f\n", ppm);
-                    }
+            Modes.estimated_ppm = ppm;
+            if (Modes.devel_log_ppm && fabs(ppm) > Modes.devel_log_ppm) {
+                fprintf(stderr, "SDR ppm: %8.1f elapsed: %6.0f ms diff: %6.0f us last jitter: %6.0f\n", ppm, elapsed_sys / 1000.0, diff_us, (double) jitter);
+            }
+            if (fabs(ppm) > 600) {
+                if (ppm < -1000) {
+                    int packets_lost = (int) nearbyint(ppm / -1820);
+                    Modes.stats_current.samples_lost += packets_lost * Modes.sdr_buf_samples;
+                    fprintf(stderr, "Lost %d packets (%.1f us) on USB, MLAT could be UNSTABLE, check sync! (ppm: %.0f)"
+                            "(or the system clock jumped for some reason)\n", packets_lost, diff_us, ppm);
+                } else {
+                    fprintf(stderr, "SDR ppm out of specification (could cause MLAT issues) or local clock jumped / not syncing with ntp or chrony! ppm: %.0f\n", ppm);
                 }
             }
             last_sys = buf->sysMicroseconds;
             last_sample = buf->sampleTimestamp;
         }
     }
+
+    last_ts = buf->sysMicroseconds;
 }
 
 static void *decodeEntryPoint(void *arg) {
-    // only go higher priority if we have multiple processors
-    if (Modes.num_procs > 1 && Modes.num_procs > Modes.decodeThreads) {
-        setPriorityPthread();
-    }
-
     MODES_NOTUSED(arg);
     srandom(get_seed());
 
@@ -774,7 +818,7 @@ static void *decodeEntryPoint(void *arg) {
      * This rules also in case a local Mode-S Beast is connected via USB.
      */
 
-    //fprintf(stderr, "startup complete after %.3f seconds.\n", (mstime() - Modes.startup_time) / 1000.0);
+    //fprintf(stderr, "startup complete after %.3f seconds.\n", getUptime() / 1000.0);
 
     interactiveInit();
 
@@ -869,12 +913,15 @@ static void *decodeEntryPoint(void *arg) {
                 threadTimedWait(&Threads.decode, &ts, 80);
             }
             mono = mono_milli_seconds();
-            // if removeStale is late by REMOVE_STALE_INTERVAL, force it to run
             if (mono > Modes.next_remove_stale + REMOVE_STALE_INTERVAL) {
                 //fprintf(stderr, "%.3f >? %3.f\n", mono / 1000.0, (Modes.next_remove_stale + REMOVE_STALE_INTERVAL)/ 1000.0);
-                pthread_mutex_unlock(&Threads.decode.mutex);
-                priorityTasksRun();
-                pthread_mutex_lock(&Threads.decode.mutex);
+                // don't force as this can cause issues (code left in for possible re-enabling if absolutely necessary)
+                // if memory serves right the main point of this was for SDR_IFILE / faster than real time
+                if (Modes.synthetic_now) {
+                    pthread_mutex_unlock(&Threads.decode.mutex);
+                    priorityTasksRun();
+                    pthread_mutex_lock(&Threads.decode.mutex);
+                }
             }
         }
         sdrCancel();
@@ -947,7 +994,7 @@ static void writeTraces(int64_t mono) {
 
 
         // set low priority for this trace pool
-        if (0) {
+        if (1) {
             int taskCount = Modes.tracePoolSize;
             threadpool_task_t *tasks = Modes.traceTasks->tasks;
             for (int i = 0; i < taskCount; i++) {
@@ -1004,7 +1051,7 @@ static void writeTraces(int64_t mono) {
                     Modes.triggerPastDayTraceWrite = 1; // activated for one sweep
                 }
 
-                if (elapsed > 30 * SECONDS && mstime() - Modes.startup_time > 10 * MINUTES) {
+                if (elapsed > 30 * SECONDS && getUptime() > 10 * MINUTES) {
                     fprintf(stderr, "trace writing iteration took %.1f seconds (roughly %.0f minutes), live traces will lag behind (historic traces are fine), "
                             "consider alloting more CPU cores or increasing json-trace-interval!\n",
                             elapsed / 1000.0, elapsed / (double) MINUTES);
@@ -1229,11 +1276,14 @@ static void cleanup_and_exit(int code) {
     sfree(Modes.net_bind_address);
     sfree(Modes.db_file);
     sfree(Modes.net_input_beast_ports);
+    sfree(Modes.net_input_planefinder_ports);
     sfree(Modes.net_output_beast_ports);
     sfree(Modes.net_output_beast_reduce_ports);
     sfree(Modes.net_output_vrs_ports);
     sfree(Modes.net_input_raw_ports);
     sfree(Modes.net_output_raw_ports);
+    sfree(Modes.net_output_uat_replay_ports);
+    sfree(Modes.net_input_uat_ports);
     sfree(Modes.net_output_sbs_ports);
     sfree(Modes.net_input_sbs_ports);
     sfree(Modes.net_input_jaero_ports);
@@ -1244,6 +1294,8 @@ static void cleanup_and_exit(int code) {
     sfree(Modes.uuidFile);
     sfree(Modes.dbIndex);
     sfree(Modes.db);
+    sfree(Modes.latString);
+    sfree(Modes.lonString);
 
     int i;
     for (i = 0; i < MODES_MAG_BUFFERS; ++i) {
@@ -1342,6 +1394,8 @@ static int make_net_connector(char *arg) {
             && strcmp(con->protocol, "sbs_out_mlat") != 0
             && strcmp(con->protocol, "sbs_out_jaero") != 0
             && strcmp(con->protocol, "sbs_out_prio") != 0
+            && strcmp(con->protocol, "asterix_out") != 0
+            && strcmp(con->protocol, "asterix_in") != 0
             && strcmp(con->protocol, "json_out") != 0
             && strcmp(con->protocol, "feedmap_out") != 0
             && strcmp(con->protocol, "gpsd_in") != 0
@@ -1352,6 +1406,7 @@ static int make_net_connector(char *arg) {
         fprintf(stderr, "Supported protocols: beast_out, beast_in, beast_reduce_out, beast_reduce_plus_out, raw_out, raw_in, \n"
                 "sbs_out, sbs_out_replay, sbs_out_mlat, sbs_out_jaero, \n"
                 "sbs_in, sbs_in_mlat, sbs_in_jaero, \n"
+                "sbs_out_prio, asterix_out, asterix_in, \n"
                 "vrs_out, json_out, gpsd_in, uat_in, \n"
                 "planefinder_in\n");
         return 1;
@@ -1488,9 +1543,13 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             Modes.interactive_display_ttl = (int64_t) (1000 * atof(arg));
             break;
         case OptLat:
+            sfree(Modes.latString);
+            Modes.latString = strdup(arg);
             Modes.fUserLat = atof(arg);
             break;
         case OptLon:
+            sfree(Modes.lonString);
+            Modes.lonString = strdup(arg);
             Modes.fUserLon = atof(arg);
             break;
         case OptMaxRange:
@@ -1502,6 +1561,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             break;
         case OptStatsRange:
             Modes.stats_range_histo = 1;
+            break;
+        case OptAutoExit:
+            Modes.auto_exit = atof(arg) * SECONDS;
             break;
         case OptStatsEvery:
             Modes.stats_display_interval = ((int64_t) nearbyint(atof(arg) / 10.0)) * 10 * SECONDS;
@@ -1537,13 +1599,19 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             Modes.heatmap_dir = strdup(arg);
             break;
         case OptDumpBeastDir:
-            tokenize(&arg, ",", token, maxTokens); if (!token[0]) { break; }
+            {
+                char *argdup = strdup(arg);
+                tokenize(&argdup, ",", token, maxTokens);
+                if (!token[0]) { sfree(argdup); break; }
 
-            sfree(Modes.dump_beast_dir);
-            Modes.dump_beast_dir = strdup(token[0]);
-            if (token[1]) { Modes.dump_interval = atoi(token[1]); }
-            // enable networking as this is required
-            Modes.net = 1;
+                sfree(Modes.dump_beast_dir);
+                Modes.dump_beast_dir = strdup(token[0]);
+                if (token[1]) { Modes.dump_interval = atoi(token[1]); }
+                // enable networking as this is required
+                Modes.net = 1;
+
+                sfree(argdup);
+            }
             break;
         case OptGlobeHistoryDir:
             sfree(Modes.globe_history_dir);
@@ -1551,6 +1619,14 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             break;
         case OptStateOnlyOnExit:
             Modes.state_only_on_exit = 1;
+            break;
+        case OptStateInterval:
+            Modes.state_write_interval = (int64_t) (atof(arg) * 1.0 * SECONDS);
+            if (Modes.state_write_interval < 59 * SECONDS) {
+                fprintf(stderr, "ERROR: --write-state-every less than 60 seconds (specified: %s)\n", arg);
+                exit(1);
+                Modes.state_write_interval = 1 * HOURS;
+            }
             break;
         case OptStateDir:
             sfree(Modes.state_parent_dir);
@@ -1566,7 +1642,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             break;
 
         case OptJaeroTimeout:
-            Modes.trackExpireJaero = (uint32_t) (atof(arg) * MINUTES);
+            Modes.trackExpireJaero = (int64_t) (atof(arg) * MINUTES);
             break;
         case OptPositionPersistence:
             Modes.position_persistence = imax(0, atoi(arg));
@@ -1617,11 +1693,19 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
         case OptNetRoSize:
             Modes.net_output_flush_size = atoi(arg);
             break;
-        case OptNetRoRate:
-            Modes.net_output_flush_interval = 1000 * atoi(arg) / 15; // backwards compatibility
-            break;
-        case OptNetRoIntervall:
+        case OptNetRoInterval:
             Modes.net_output_flush_interval = (int64_t) (1000 * atof(arg));
+            break;
+        case OptNetRoIntervalBeastReduce:
+            Modes.net_output_flush_interval_beast_reduce = (int64_t) (1000 * atof(arg));
+            break;
+        case OptNetUatReplayPorts:
+            sfree(Modes.net_output_uat_replay_ports);
+            Modes.net_output_uat_replay_ports = strdup(arg);
+            break;
+        case OptNetUatInPorts:
+            sfree(Modes.net_input_uat_ports);
+            Modes.net_input_uat_ports = strdup(arg);
             break;
         case OptNetRoPorts:
             sfree(Modes.net_output_raw_ports);
@@ -1639,6 +1723,17 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
             sfree(Modes.net_input_beast_ports);
             Modes.net_input_beast_ports = strdup(arg);
             break;
+        case OptNetAsterixOutPorts:
+            sfree(Modes.net_output_asterix_ports);
+            Modes.net_output_asterix_ports = strdup(arg);
+            break;
+	case OptNetAsterixInPorts:
+	    sfree(Modes.net_input_asterix_ports);
+	    Modes.net_input_asterix_ports = strdup(arg);
+	    break;
+        case OptNetAsterixReduce:
+            Modes.asterixReduce = 1;
+            break;
         case OptNetBeastReducePorts:
             sfree(Modes.net_output_beast_reduce_ports);
             Modes.net_output_beast_reduce_ports = strdup(arg);
@@ -1650,6 +1745,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
         case OptNetBeastReduceFilterDist:
             if (atof(arg) > 0)
                 Modes.beast_reduce_filter_distance = (float) atof(arg) * 1852.0f; // convert to meters
+            break;
+        case OptNetBeastReduceOptimizeMlat:
+            Modes.beast_reduce_optimize_mlat = 1;
             break;
         case OptNetBeastReduceInterval:
             if (atof(arg) >= 0)
@@ -1779,8 +1877,10 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
 
         case OptDevel:
             {
-                tokenize(&arg, ",", token, maxTokens);
+                char *argdup = strdup(arg);
+                tokenize(&argdup, ",", token, maxTokens);
                 if (!token[0]) {
+                    sfree(argdup);
                     break;
                 }
                 if (strcasecmp(token[0], "lastStatus") == 0) {
@@ -1795,6 +1895,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
                     if (token[1]) {
                         Modes.apiThreadCount = atoi(token[1]);
                     }
+                }
+                if (strcasecmp(token[0], "legacy_history") == 0) {
+                    Modes.legacy_history = 1;
                 }
                 if (strcasecmp(token[0], "beast_forward_noforward") == 0) {
                     Modes.beast_forward_noforward = 1;
@@ -1814,14 +1917,39 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
                     Modes.ping_reduce = Modes.ping_reject / 2;
                 }
 
+                if (strcasecmp(token[0], "log_usb_jitter") == 0 && token[1]) {
+                    Modes.log_usb_jitter = atoi(token[1]);
+                }
+
+                if (strcasecmp(token[0], "log_ppm") == 0) {
+                    if (token[1]) {
+                        Modes.devel_log_ppm = atoi(token[1]);
+                    }
+                    if (Modes.devel_log_ppm == 0) {
+                        Modes.devel_log_ppm = -1;
+                    }
+                    // setting to -1 to enable due to the following check
+                    // if (Modes.devel_log_ppm && fabs(ppm) > Modes.devel_log_ppm) {
+                }
+
+                if (strcasecmp(token[0], "sbs_override_squawk") == 0 && token[1]) {
+                    Modes.sbsOverrideSquawk = atoi(token[1]);
+                }
                 if (strcasecmp(token[0], "messageRateMult") == 0 && token[1]) {
                     Modes.messageRateMult = atof(token[1]);
+                }
+                if (strcasecmp(token[0], "forwardMinMessages") == 0 && token[1]) {
+                    Modes.net_forward_min_messages = atoi(token[1]);
+                    fprintf(stderr, "forwardMinMessages: %u\n", Modes.net_forward_min_messages);
                 }
                 if (strcasecmp(token[0], "incrementId") == 0) {
                     Modes.incrementId = 1;
                 }
                 if (strcasecmp(token[0], "debugPlanefinder") == 0) {
                     Modes.debug_planefinder = 1;
+                }
+                if (strcasecmp(token[0], "debugFlush") == 0) {
+                    Modes.debug_flush = 1;
                 }
                 if (strcasecmp(token[0], "omitGlobeFiles") == 0) {
                     Modes.omitGlobeFiles = 1;
@@ -1832,12 +1960,27 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
                 if (strcasecmp(token[0], "disableAcasJson") == 0) {
                     Modes.enableAcasJson = 0;
                 }
+                if (strcasecmp(token[0], "enableConnsJson") == 0) {
+                    Modes.enableConnsJson = 1;
+                }
+                if (strcasecmp(token[0], "tar1090NoGlobe") == 0) {
+                    Modes.tar1090_no_globe = 1;
+                }
                 if (strcasecmp(token[0], "provokeSegfault") == 0) {
                     Modes.debug_provoke_segfault = 1;
                 }
                 if (strcasecmp(token[0], "debugGPS") == 0) {
                     Modes.debug_gps = 1;
                 }
+                if (strcasecmp(token[0], "debugZstd") == 0) {
+                    Modes.debug_zstd = 1;
+                }
+                if (strcasecmp(token[0], "disableZstd") == 0) {
+                    Modes.enable_zstd = 0;
+                    Modes.enableBinGz = 1;
+                }
+
+                sfree(argdup);
             }
             break;
 
@@ -1932,9 +2075,19 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
         case OptBladeDecim:
         case OptBladeBw:
 #endif
+#ifdef ENABLE_HACKRF
+	case OptHackRfGainEnable:
+        case OptHackRfVgaGain:
+#endif
 #ifdef ENABLE_PLUTOSDR
         case OptPlutoUri:
         case OptPlutoNetwork:
+#endif
+#ifdef ENABLE_SOAPYSDR
+        case OptSoapyAntenna:
+        case OptSoapyBandwith:
+        case OptSoapyEnableAgc:
+        case OptSoapyGainElement:
 #endif
             if (Modes.sdr_type == SDR_NONE) {
                 fprintf(stderr, "ERROR: SDR / device type specific options must be specified AFTER the --device-type xyz parameter.\n");
@@ -2000,6 +2153,9 @@ int parseCommandLine(int argc, char **argv) {
 #ifdef ENABLE_PLUTOSDR
         "ENABLE_PLUTOSDR "
 #endif
+#ifdef ENABLE_SOAPYSDR
+        "ENABLE_SOAPYSDR "
+#endif
 #ifdef SC16Q11_TABLE_BITS
 #define stringize(x) _stringize(x)
         "SC16Q11_TABLE_BITS=" stringize(SC16Q11_TABLE_BITS)
@@ -2010,7 +2166,10 @@ int parseCommandLine(int argc, char **argv) {
 #undef verstring
 
     if (Modes.viewadsb) {
-        doc = "vieadsb Mode-S/ADSB/TIS commandline viewer   ";
+        doc = "vieadsb Mode-S/ADSB/TIS commandline viewer "
+            "\n\nBy default, viewadsb will TCP connect to 127.0.0.1:30005 as a data source."
+            "\nTypical readsb / dump1090 installs will provide beast data on port 30005."
+            ;
     }
 
     struct argp_option *options = Modes.viewadsb ? optionsViewadsb : optionsReadsb;
@@ -2036,7 +2195,11 @@ int parseCommandLine(int argc, char **argv) {
 
     print_commandline(argc, argv);
 
-    log_with_timestamp("readsb starting up.");
+    if (Modes.viewadsb) {
+        log_with_timestamp("viewadsb starting up.");
+    } else {
+        log_with_timestamp("readsb starting up.");
+    }
     fprintf(stderr, VERSION_STRING"\n");
 
     return 0;
@@ -2088,11 +2251,13 @@ static void configAfterParse() {
     cpu_set_t mask;
     if (sched_getaffinity(getpid(), sizeof(mask), &mask) == 0) {
         Modes.num_procs = CPU_COUNT(&mask);
+#if (defined(__arm__))
         if (Modes.num_procs < 2 && !Modes.preambleThreshold && Modes.sdr_type != SDR_NONE) {
             fprintf(stderr, "WARNING: Reducing preamble threshold / decoding performance as this system has only 1 core (explicitely set --preamble-threshold to disable this behaviour)!\n");
             Modes.preambleThreshold = PREAMBLE_THRESHOLD_PIZERO;
             Modes.fixDF = 0;
         }
+#endif
     }
     if (Modes.num_procs < 1) {
         Modes.num_procs = 1; // sanity check
@@ -2123,6 +2288,7 @@ static void configAfterParse() {
             || (Modes.fUserLat < -90.0) // and
             || (Modes.fUserLon > 360.0) // Longitude must be -180 to +360
             || (Modes.fUserLon < -180.0)) {
+        fprintf(stderr, "INVALID lat: %s, lon: %s\n", Modes.latString, Modes.lonString);
         Modes.fUserLat = Modes.fUserLon = 0.0;
     } else if (Modes.fUserLon > 180.0) { // If Longitude is +180 to +360, make it -180 to 0
         Modes.fUserLon -= 360.0;
@@ -2132,7 +2298,7 @@ static void configAfterParse() {
     // Set the user LatLon valid flag only if either Lat or Lon are non zero. Note the Greenwich meridian
     if ((Modes.fUserLat != 0.0) || (Modes.fUserLon != 0.0)) {
         Modes.userLocationValid = 1;
-        fprintf(stderr, "Using lat: %9.4f, lon: %9.4f\n", Modes.fUserLat, Modes.fUserLon);
+        fprintf(stderr, "Using lat: %s, lon: %s\n", Modes.latString, Modes.lonString);
     }
     if (!Modes.userLocationValid || !Modes.json_dir) {
         Modes.outline_json = 0; // disable outline_json
@@ -2151,6 +2317,8 @@ static void configAfterParse() {
                 Modes.position_persistence);
     }
 
+    Modes.net_output_flush_size -= 8; // allow for sending 8 byte timestamp in some cases, unfortunate hack
+
     if (Modes.net_output_flush_size > (MODES_OUT_BUF_SIZE)) {
         Modes.net_output_flush_size = MODES_OUT_BUF_SIZE;
     }
@@ -2162,6 +2330,18 @@ static void configAfterParse() {
     }
     if (Modes.net_output_flush_interval < 0)
         Modes.net_output_flush_interval = 0;
+
+    if (Modes.net_output_flush_interval < 51 && Modes.sdr_type != SDR_NONE && !(Modes.sdr_type == SDR_MODESBEAST || Modes.sdr_type == SDR_GNS)) {
+        // the SDR code runs the network tasks about every 50ms
+        // avoid delay by just flushing every call of the network tasks
+        // somewhat hacky, anyone reading this code surprised at this point?
+        Modes.net_output_flush_interval = 0;
+    }
+
+    if (Modes.net_output_flush_interval_beast_reduce < 0) {
+        Modes.net_output_flush_interval_beast_reduce = Modes.net_output_flush_interval;
+    }
+
 
     if (Modes.net_sndbuf_size > (MODES_NET_SNDBUF_MAX)) {
         Modes.net_sndbuf_size = MODES_NET_SNDBUF_MAX;
@@ -2197,10 +2377,10 @@ static void configAfterParse() {
     }
 }
 
-static void notask_save_blob(uint32_t blob) {
+static void notask_save_blob(uint32_t blob, char *stateDir) {
     threadpool_buffer_t pbuffer1 = { 0 };
     threadpool_buffer_t pbuffer2 = { 0 };
-    save_blob(blob, &pbuffer1, &pbuffer2);
+    save_blob(blob, &pbuffer1, &pbuffer2, stateDir);
     free_threadpool_buffer(&pbuffer1);
     free_threadpool_buffer(&pbuffer2);
 }
@@ -2226,9 +2406,53 @@ static void loadReplaceState() {
     free(Modes.replace_state_blob);
     Modes.replace_state_blob = NULL;
 }
+static int checkWriteStateDir(char *baseDir) {
+    if (!baseDir) {
+        return 0;
+    }
+    char filename[PATH_MAX];
+    snprintf(filename, PATH_MAX, "%s/writeState", baseDir);
+    int fd = open(filename, O_RDONLY);
+    if (fd <= 0) {
+        return 0;
+    }
 
-static void checkReplaceState() {
-    if (!Modes.state_dir) {
+    char tmp[3];
+    int len = read(fd, tmp, 2);
+    close(fd);
+
+    tmp[2] = '\0';
+
+    if (len == 0) {
+        // this ignores baseDir and always writes it to state_dir / disk
+        writeInternalState();
+    } else if (len == 2) {
+        uint32_t suffix = strtol(tmp, NULL, 16);
+        notask_save_blob(suffix, baseDir);
+        fprintf(stderr, "save_blob: %02x\n", suffix);
+    }
+
+    unlink(filename);
+    // unlink only after writing state, if the file doesn't exist that's fine as well
+    // this is a hack to detect from a shell script when the task is done
+
+    return 1;
+}
+
+static int checkWriteState() {
+    if (Modes.json_dir) {
+        char getStateDir[PATH_MAX];
+        snprintf(getStateDir, PATH_MAX, "%s/getState", Modes.json_dir);
+        if (checkWriteStateDir(getStateDir)) {
+            return 1;
+        }
+    }
+    return checkWriteStateDir(Modes.state_dir);
+}
+
+
+static void checkReplaceStateDir(char *baseDir) {
+    if (!baseDir) {
         return;
     }
     if (Modes.replace_state_blob) {
@@ -2236,8 +2460,8 @@ static void checkReplaceState() {
     }
     char filename[PATH_MAX];
 
-    snprintf(filename, PATH_MAX, "%s/replaceState", Modes.state_dir);
-    if (!Modes.replace_state_blob && access(filename, R_OK) == 0) {
+    snprintf(filename, PATH_MAX, "%s/replaceState", baseDir);
+    if (access(filename, R_OK) == 0) {
         for (int j = 0; j < STATE_BLOBS; j++) {
             char blob[1024];
             snprintf(blob, 1024, "%s/blob_%02x.zstl", filename, j);
@@ -2252,6 +2476,40 @@ static void checkReplaceState() {
     }
 }
 
+static void checkReplaceState() {
+    checkReplaceStateDir(Modes.state_dir);
+    checkReplaceStateDir(Modes.json_dir);
+}
+
+static void checkSetGain() {
+    if (!Modes.json_dir) {
+        return;
+    }
+
+    char filename[PATH_MAX];
+    snprintf(filename, PATH_MAX, "%s/setGain", Modes.json_dir);
+    int fd = open(filename, O_RDONLY);
+    if (fd <= 0) {
+        return;
+    }
+
+    char tmp[128];
+    int len = read(fd, tmp, 127);
+    close(fd);
+    unlink(filename);
+
+    if (len <= 0) { return; }
+
+    tmp[len] = '\0';
+
+    double newGain = atof(tmp);
+    Modes.gain = (int) (newGain * 10); // Gain is in tens of DBs
+
+    sdrSetGain();
+
+    //fprintf(stderr, "Modes.gain (tens of dB): %d\n", Modes.gain);
+}
+
 static void miscStuff(int64_t now) {
 
     checkNewDay(now);
@@ -2263,55 +2521,45 @@ static void miscStuff(int64_t now) {
             nextOutlineWrite = now + 15 * SECONDS;
         }
 
-        if (!Modes.state_only_on_exit) {
-            static int64_t nextRangeDirsWrite;
-            if (now > nextRangeDirsWrite) {
-                nextRangeDirsWrite = now + 5 * MINUTES;
-                writeRangeDirs();
+        static int64_t nextRangeDirsWrite;
+        if (now > nextRangeDirsWrite) {
+            nextRangeDirsWrite = now + 5 * MINUTES;
+            if (Modes.state_only_on_exit) {
+                nextRangeDirsWrite = now + 6 * HOURS;
             }
+            writeRangeDirs();
         }
     }
 
+    checkSetGain();
+
     // don't do everything at once ... this stuff isn't that time critical it'll get its turn
+
+    if (checkWriteState()) {
+        return;
+    }
 
     if (Modes.state_dir) {
         static uint32_t blob; // current blob
         static int64_t next_blob;
 
-        char filename[PATH_MAX];
-        snprintf(filename, PATH_MAX, "%s/writeState", Modes.state_dir);
-        int fd = open(filename, O_RDONLY);
-        if (fd > -1) {
-            next_blob = now + 45 * SECONDS;
-
-            char tmp[3];
-            int len = read(fd, tmp, 2);
-            close(fd);
-
-            tmp[2] = '\0';
-
-            if (len == 0) {
-                writeInternalState();
-            } else if (len == 2) {
-                uint32_t suffix = strtol(tmp, NULL, 16);
-                notask_save_blob(suffix);
-                fprintf(stderr, "save_blob: %02x\n", suffix);
-            }
-
-            unlink(filename);
-            // unlink only after writing state, if the file doesn't exist that's fine as well
-            // this is a hack to detect from a shell script when the task is done
-
-            return;
-        }
-
         // only continuously write state if we keep permanent trace
         if (!Modes.state_only_on_exit && now > next_blob) {
             //fprintf(stderr, "save_blob: %02x\n", blob);
-            notask_save_blob(blob);
-            blob = (blob + 1) % STATE_BLOBS;
-            next_blob = now + 60 * MINUTES / STATE_BLOBS;
+            int64_t blob_interval = Modes.state_write_interval / STATE_BLOBS;
+            next_blob = now + blob_interval;
 
+            struct timespec watch;
+            startWatch(&watch);
+
+            notask_save_blob(blob, Modes.state_dir);
+
+            int64_t elapsed = stopWatch(&watch);
+            if (elapsed > 0.5 * SECONDS || elapsed > blob_interval / 3) {
+                fprintf(stderr, "WARNING: save_blob %02x took %"PRIu64" ms!\n", blob, elapsed);
+            }
+
+            blob = (blob + 1) % STATE_BLOBS;
             return;
         }
     }
@@ -2324,6 +2572,8 @@ static void miscStuff(int64_t now) {
     static int64_t next_clients_json;
     if (Modes.json_dir && now > next_clients_json) {
         next_clients_json = now + 10 * SECONDS;
+        if (Modes.enableConnsJson) {
+        }
         if (Modes.netIngest)
             free(writeJsonToFile(Modes.json_dir, "clients.json", generateClientsJson()).buffer);
         if (Modes.netReceiverIdJson)
@@ -2340,10 +2590,8 @@ static void miscStuff(int64_t now) {
 static void *miscEntryPoint(void *arg) {
     MODES_NOTUSED(arg);
 
-    if (0) {
-        // this is a low priority thread
-        setLowestPriorityPthread();
-    }
+    // set this thread low priority
+    setLowestPriorityPthread();
 
     pthread_mutex_lock(&Threads.misc.mutex);
 
@@ -2387,11 +2635,11 @@ static void *miscEntryPoint(void *arg) {
 static void _sigaction_range(struct sigaction *sa, int first, int last) {
     int sig;
     for (sig = first; sig <= last; ++sig) {
+        if (sig == SIGKILL || sig == SIGSTOP) {
+            continue;
+        }
         if (sigaction(sig, sa, NULL)) {
-            /* SIGKILL/SIGSTOP trigger EINVAL.  Ignore by default. */
-            if (errno != EINVAL) {
-                fprintf(stderr, "sigaction(%s[%i]) failed: %s\n", strsignal(sig), sig, strerror(errno));
-            }
+            fprintf(stderr, "sigaction(%s[%i]) failed: %s\n", strsignal(sig), sig, strerror(errno));
         }
     }
 }
@@ -2438,7 +2686,7 @@ int main(int argc, char **argv) {
     // Set sane defaults
     configSetDefaults();
 
-    Modes.startup_time = mstime();
+    Modes.startup_time = mono_milli_seconds();
 
     if (lzo_init() != LZO_E_OK)
     {
@@ -2492,6 +2740,12 @@ int main(int argc, char **argv) {
 
     for (int j = 0; j < STAT_BUCKETS; ++j)
         Modes.stats_10[j].start = Modes.stats_10[j].end = Modes.stats_current.start;
+
+    if (Modes.json_dir) {
+        char pathbuf[PATH_MAX];
+        snprintf(pathbuf, PATH_MAX, "%s/getState", Modes.json_dir);
+        mkdir_error(pathbuf, 0755, stderr);
+    }
 
     if (Modes.json_dir && Modes.json_globe_index) {
         char pathbuf[PATH_MAX];
@@ -2556,7 +2810,7 @@ int main(int argc, char **argv) {
     if (Modes.json_dir) {
         threadCreate(&Threads.json, NULL, jsonEntryPoint, NULL);
 
-        if (Modes.json_globe_index && !Modes.omitGlobeFiles) {
+        if (Modes.json_globe_index && !Modes.omitGlobeFiles && !Modes.tar1090_no_globe) {
             // globe_xxxx.json
             threadCreate(&Threads.globeJson, NULL, globeJsonEntryPoint, NULL);
         }
@@ -2591,7 +2845,17 @@ int main(int argc, char **argv) {
     struct timespec mainloopTimer;
     startWatch(&mainloopTimer);
     while (!Modes.exit) {
-        if (epoll_wait(mainEpfd, events, maxEvents, 5 * SECONDS) > 0) {
+        int64_t wait_time = 5 * SECONDS;
+        if (Modes.auto_exit) {
+            int64_t uptime = getUptime();
+            if (uptime + wait_time >= Modes.auto_exit) {
+                wait_time = imax(1, Modes.auto_exit - uptime);
+            }
+            if (uptime >= Modes.auto_exit) {
+                setExit(1);
+            }
+        }
+        if (epoll_wait(mainEpfd, events, maxEvents, wait_time) > 0) {
             if (Modes.exitSoon) {
                 if (Modes.apiShutdownDelay) {
                     // delay for graceful api shutdown
@@ -2626,12 +2890,12 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "<3>FATAL: priorityTasksRun() interval %.1f seconds! Trying for an orderly shutdown as well as possible!\n", (double) elapsed1 / SECONDS);
                 fprintf(stderr, "<3>lockThreads() probably hung on %s\n", Modes.currentTask);
                 setExit(2);
-                break;
+                // don't break here, otherwise exitNowEventfd isn't signaled and we don't have a proper exit
+                // setExit signals exitSoonEventfd, the main loop will then signal exitNowEventfd
             }
             if (elapsed2 > 60 * SECONDS && !Modes.synthetic_now) {
                 fprintf(stderr, "<3>FATAL: removeStale() interval %.1f seconds! Trying for an orderly shutdown as well as possible!\n", (double) elapsed2 / SECONDS);
                 setExit(2);
-                break;
             }
         }
     }
@@ -2687,6 +2951,7 @@ int main(int argc, char **argv) {
 
     pthread_mutex_destroy(&Modes.traceDebugMutex);
     pthread_mutex_destroy(&Modes.hungTimerMutex);
+    pthread_mutex_destroy(&Modes.sdrControlMutex);
 
     if (Modes.debug_bogus) {
         display_total_short_range_stats();
@@ -2706,16 +2971,38 @@ int main(int argc, char **argv) {
         destroy_task_group(Modes.traceTasks);
     }
 
-    // frees aircraft when Modes.free_aircraft is set
-    // writes state if Modes.state_dir is set
-    Modes.free_aircraft = 1;
-    writeInternalState();
-
-    if (Modes.exit != 1) {
-        log_with_timestamp("Abnormal exit.");
-        cleanup_and_exit(1);
+    if (Modes.state_dir && Modes.sdrOpenFailed) {
+        fprintf(stderr, "not saving state: SDR failed\n");
+        sfree(Modes.state_dir);
+        Modes.state_dir = NULL;
     }
 
-    log_with_timestamp("Normal exit.");
+    Modes.free_aircraft = 1;
+    // frees aircraft when Modes.free_aircraft is set
+    // writes state if Modes.state_dir is set
+    writeInternalState();
+
+    {
+        char *exitString = "Normal exit.";
+        if (Modes.exit != 1) {
+            exitString = "Abnormal exit.";
+        }
+        int64_t uptime = getUptime();
+
+        int days = uptime / (24 * HOURS);
+        uptime -= days * (24 * HOURS);
+        int hours = uptime / HOURS;
+        uptime -= hours * HOURS;
+        int minutes = uptime / MINUTES;
+        uptime -= minutes * MINUTES;
+        double seconds = uptime / (double) SECONDS;
+
+        log_with_timestamp("%s uptime: %2dd %2dh %2dm %.3fs",
+                exitString, days, hours, minutes, seconds);
+    }
+
+    if (Modes.exit != 1) {
+        cleanup_and_exit(1);
+    }
     cleanup_and_exit(0);
 }

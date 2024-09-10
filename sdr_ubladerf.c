@@ -44,20 +44,20 @@ void ubladeRFInitConfig() {
     uBladeRF.device = NULL;
 }
 
-bool ubladeRFHandleOption(int argc, char *argv) {
-    switch (argc) {
+bool ubladeRFHandleOption(int key, char *arg) {
+    switch (key) {
         case OptBladeFpgaDir:
-            uBladeRF.fpga_path = strdup(argv);
+            uBladeRF.fpga_path = strdup(arg);
             break;
         case OptBladeDecim:
-            uBladeRF.decimation = atoi(argv);
+            uBladeRF.decimation = atoi(arg);
             break;
         case OptBladeBw:
-            if (!strcasecmp(argv, "bypass")) {
+            if (!strcasecmp(arg, "bypass")) {
                 uBladeRF.lpf_mode = BLADERF_LPF_BYPASSED;
             } else {
                 uBladeRF.lpf_mode = BLADERF_LPF_NORMAL;
-                uBladeRF.lpf_bandwidth = atoi(argv);
+                uBladeRF.lpf_bandwidth = atoi(arg);
             }
             break;
         default:
@@ -221,6 +221,13 @@ bool ubladeRFOpen() {
             goto error;
     }
 
+    // Close and re-open the bladeRF, otherwise we get "An unexpected error occurred" in later calls.
+    bladerf_close(uBladeRF.device);
+    if ((status = bladerf_open(&uBladeRF.device, Modes.dev_name)) < 0) {
+        fprintf(stderr, "Failed to open bladeRF: %s\n", bladerf_strerror(status));
+        goto error;
+    }
+
     if ((status = bladerf_set_sample_rate(uBladeRF.device, BLADERF_MODULE_RX, Modes.sample_rate * uBladeRF.decimation, NULL)) < 0) {
         fprintf(stderr, "bladerf_set_sample_rate failed: %s\n", bladerf_strerror(status));
         goto error;
@@ -332,6 +339,9 @@ static void *handle_bladerf_samples(struct bladerf *dev,
     static uint64_t nextTimestamp = 0;
     static bool dropping = false;
 
+    int64_t sysMicroseconds = mono_micro_seconds();
+    int64_t sysTimestamp = mstime();
+
     MODES_NOTUSED(dev);
     MODES_NOTUSED(stream);
     MODES_NOTUSED(meta);
@@ -359,8 +369,8 @@ static void *handle_bladerf_samples(struct bladerf *dev,
     dropping = false;
     unlockReader();
 
-    outbuf->sysTimestamp = mstime();
-    outbuf->sysMicroseconds = mono_micro_seconds();
+    outbuf->sysTimestamp = sysTimestamp;
+    outbuf->sysMicroseconds = sysMicroseconds;
 
     // Copy trailing data from last block (or reset if not valid)
     if (outbuf->dropped == 0) {

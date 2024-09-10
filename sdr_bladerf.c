@@ -48,20 +48,20 @@ void bladeRFInitConfig() {
     BladeRF.device = NULL;
 }
 
-bool bladeRFHandleOption(int argc, char *argv) {
-    switch (argc) {
+bool bladeRFHandleOption(int key, char *arg) {
+    switch (key) {
         case OptBladeFpgaDir:
-            BladeRF.fpga_path = strdup(argv);
+            BladeRF.fpga_path = strdup(arg);
             break;
         case OptBladeDecim:
-            BladeRF.decimation = atoi(argv);
+            BladeRF.decimation = atoi(arg);
             break;
         case OptBladeBw:
-            if (!strcasecmp(argv, "bypass")) {
+            if (!strcasecmp(arg, "bypass")) {
                 BladeRF.lpf_mode = BLADERF_LPF_BYPASSED;
             } else {
                 BladeRF.lpf_mode = BLADERF_LPF_NORMAL;
-                BladeRF.lpf_bandwidth = atoi(argv);
+                BladeRF.lpf_bandwidth = atoi(arg);
             }
             break;
         default:
@@ -291,6 +291,9 @@ static void *handle_bladerf_samples(struct bladerf *dev,
     static uint64_t nextTimestamp = 0;
     static bool dropping = false;
 
+    int64_t sysMicroseconds = mono_micro_seconds();
+    int64_t sysTimestamp = mstime();
+
     MODES_NOTUSED(dev);
     MODES_NOTUSED(stream);
     MODES_NOTUSED(meta);
@@ -330,8 +333,8 @@ static void *handle_bladerf_samples(struct bladerf *dev,
     outbuf->length = 0;
     outbuf->mean_level = outbuf->mean_power = 0;
 
-    outbuf->sysTimestamp = mstime();
-    outbuf->sysMicroseconds = mono_micro_seconds();
+    outbuf->sysTimestamp = sysTimestamp;
+    outbuf->sysMicroseconds = sysMicroseconds;
 
     unsigned blocks_processed = 0;
     unsigned samples_per_block = (BladeRF.block_size - 16) / 4;

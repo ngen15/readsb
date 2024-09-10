@@ -77,25 +77,24 @@ void ifileInitConfig(void) {
     ifile.readbuf = NULL;
     ifile.converter = NULL;
     ifile.converter_state = NULL;
-    Modes.synthetic_now = Modes.startup_time;
 }
 
-bool ifileHandleOption(int argc, char *argv) {
-    switch (argc) {
+bool ifileHandleOption(int key, char *arg) {
+    switch (key) {
         case OptIfileName:
-            ifile.filename = strdup(argv);
+            ifile.filename = strdup(arg);
             Modes.sdr_type = SDR_IFILE;
             break;
         case OptIfileFormat:
-            if (!strcasecmp(argv, "uc8")) {
+            if (!strcasecmp(arg, "uc8")) {
                 ifile.input_format = INPUT_UC8;
-            } else if (!strcasecmp(argv, "sc16")) {
+            } else if (!strcasecmp(arg, "sc16")) {
                 ifile.input_format = INPUT_SC16;
-            } else if (!strcasecmp(argv, "sc16q11")) {
+            } else if (!strcasecmp(arg, "sc16q11")) {
                 ifile.input_format = INPUT_SC16Q11;
             } else {
                 fprintf(stderr, "Input format '%s' not understood (supported values: UC8, SC16, SC16Q11)\n",
-                        argv);
+                        arg);
                 return false;
             }
             break;
@@ -121,13 +120,18 @@ bool ifileOpen(void) {
         return false;
     }
 
-    if (!strcmp(ifile.filename, "-")) {
+    if (strcmp(ifile.filename, "-") == 0) {
         ifile.fd = STDIN_FILENO;
     } else if ((ifile.fd = open(ifile.filename, O_RDONLY)) < 0) {
         fprintf(stderr, "ifile: could not open %s: %s\n",
                 ifile.filename, strerror(errno));
         return false;
     }
+
+    if (strcmp(ifile.filename, "-") != 0) {
+        Modes.synthetic_now = mstime();
+    }
+
 
     switch (ifile.input_format) {
         case INPUT_UC8:

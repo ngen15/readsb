@@ -800,7 +800,7 @@ static void save_blobs(void *arg, threadpool_threadbuffers_t *threadbuffers) {
     for (int j = info->from; j < info->to; j++) {
         //fprintf(stderr, "save_blob(%d)\n", j);
 
-        save_blob(j, &threadbuffers->buffers[0], &threadbuffers->buffers[1]);
+        save_blob(j, &threadbuffers->buffers[0], &threadbuffers->buffers[1], Modes.state_dir);
 
         if (Modes.free_aircraft) {
             int stride = AIRCRAFT_BUCKETS / STATE_BLOBS;
@@ -2314,11 +2314,9 @@ int traceAdd(struct aircraft *a, struct modesMessage *mm, int64_t now, int stale
         max_speed_diff *= 2;
     }
 
-    if (Modes.json_trace_interval > 5 * SECONDS) {
-        if (a->pos_reliable_valid.source == SOURCE_MLAT) {
-            min_elapsed = 1500;
-            max_elapsed /= 2;
-        }
+    if (max_elapsed > 5 * SECONDS && a->pos_reliable_valid.source == SOURCE_MLAT) {
+        min_elapsed = 1500;
+        max_elapsed = imax(max_elapsed / 2, 5 * SECONDS);
     }
     // some towers on MLAT .... create unnecessary data
     // only reduce data produced for configurations with trace interval more than 5 seconds, others migh want EVERY DOT :)
@@ -2345,6 +2343,10 @@ int traceAdd(struct aircraft *a, struct modesMessage *mm, int64_t now, int stale
                 track = -1;
             }
         }
+    }
+
+    if (max_elapsed > 5 * SECONDS && a->pos_reliable_valid.source != SOURCE_MLAT && track == -1) {
+            max_elapsed = imax(max_elapsed / 4, 5 * SECONDS);
     }
 
     if (a->trace_current_len == 0)
@@ -2651,8 +2653,8 @@ no_save_state:
     return posUsed || bufferedPosUsed;
 }
 
-void save_blob(int blob, threadpool_buffer_t *pbuffer1, threadpool_buffer_t *pbuffer2) {
-    if (!Modes.state_dir)
+void save_blob(int blob, threadpool_buffer_t *pbuffer1, threadpool_buffer_t *pbuffer2, char *stateDir) {
+    if (!stateDir)
         return;
     //static int count;
     //fprintf(stderr, "Save blob: %02x, count: %d\n", blob, ++count);
@@ -2668,13 +2670,13 @@ void save_blob(int blob, threadpool_buffer_t *pbuffer1, threadpool_buffer_t *pbu
     char filename[PATH_MAX];
     char tmppath[PATH_MAX];
     if (zst) {
-        snprintf(filename, 1024, "%s/blob_%02x.zstl", Modes.state_dir, blob);
+        snprintf(filename, 1024, "%s/blob_%02x.zstl", stateDir, blob);
     } else if (lzo) {
-        snprintf(filename, 1024, "%s/blob_%02x.lzol", Modes.state_dir, blob);
+        snprintf(filename, 1024, "%s/blob_%02x.lzol", stateDir, blob);
     } else if (gzip) {
-        snprintf(filename, 1024, "%s/blob_%02x.gz", Modes.state_dir, blob);
+        snprintf(filename, 1024, "%s/blob_%02x.gz", stateDir, blob);
     } else {
-        snprintf(filename, 1024, "%s/blob_%02x", Modes.state_dir, blob);
+        snprintf(filename, 1024, "%s/blob_%02x", stateDir, blob);
     }
     snprintf(tmppath, PATH_MAX, "%s.readsb_tmp", filename);
 
@@ -3093,11 +3095,12 @@ static inline void heatmapCheckAlloc(struct heatEntry **buffer, int64_t **slices
         *alloc *= 3;
         *buffer = realloc(*buffer, *alloc * sizeof(struct heatEntry));
         *slices = realloc(*slices, *alloc * sizeof(int64_t));
-        if (!*buffer || !*slices) {
-            fprintf(stderr, "<3> FATAL: handleHeatmap not enough memory, trying to allocate %lld bytes\n",
-                    (long long) (*alloc * sizeof(struct heatEntry)));
-            exit(1);
-        }
+    }
+
+    if (!*buffer || !*slices || *alloc < 0) {
+        fprintf(stderr, "<3> FATAL: handleHeatmap not enough memory, trying to allocate %lld bytes\n",
+                (((long long) * alloc) * sizeof(struct heatEntry)));
+        exit(1);
     }
 }
 
@@ -3143,7 +3146,7 @@ int handleHeatmap(int64_t now) {
     utc.tm_sec = 0;
     int64_t start = 1000 * (int64_t) (timegm(&utc));
     int64_t end = start + 30 * MINUTES;
-    int64_t num_slices = (int)((30 * MINUTES) / Modes.heatmap_interval);
+    int64_t num_slices = (int64_t)((30 * MINUTES) / Modes.heatmap_interval);
 
 
     char pathbuf[PATH_MAX];

@@ -727,7 +727,7 @@ static struct char_buffer apiReq(struct apiThread *thread, struct apiOptions *op
         sfree(matches);
     }
 
-    if (options->zstd) {
+    if (options->zstd || options->zstd_encode) {
         struct char_buffer new = { 0 };
         size_t new_alloc = API_REQ_PADSTART + ZSTD_compressBound(alloc);
         new.buffer = cmalloc(new_alloc);
@@ -803,7 +803,7 @@ static inline void apiGenerateJson(struct apiBuffer *buffer, int64_t now) {
     char *end = buffer->json + alloc;
 
     for (int i = 0; i < buffer->len; i++) {
-        if ((p + 2000) >= end) {
+        if ((p + 16 * 1024) >= end) {
             int used = p - buffer->json;
             alloc *= 2;
             buffer->json = (char *) realloc(buffer->json, alloc);
@@ -1022,10 +1022,10 @@ static void sendStatus(int fd, int keepalive, const char *http_status) {
 
     p = safe_snprintf(p, end,
     "HTTP/1.1 %s\r\n"
-    "server: readsb/3.1442\r\n"
-    "connection: %s\r\n"
-    "cache-control: no-store\r\n"
-    "content-length: 0\r\n\r\n",
+    "Server: readsb/wiedehopf\r\n"
+    "Connection: %s\r\n"
+    "Cache-control: no-store\r\n"
+    "Content-length: 0\r\n\r\n",
     http_status,
     keepalive ? "keep-alive" : "close");
 
@@ -1078,7 +1078,7 @@ static int parseDoubles(char *start, char *end, double *results, int max) {
 }
 
 // expects lower cased input
-static struct char_buffer parseFetch(struct apiCon *con, struct char_buffer *request, struct apiThread *thread) {
+static struct char_buffer parseFetch(struct apiCon *con, struct char_buffer *request, struct apiOptions *options, struct apiThread *thread) {
     struct char_buffer invalid = { 0 };
 
     char *req = request->buffer;
@@ -1099,9 +1099,6 @@ static struct char_buffer parseFetch(struct apiCon *con, struct char_buffer *req
 
     // we only want the URL
     *eoq = '\0';
-
-    struct apiOptions optionsBack = { 0 };
-    struct apiOptions *options = &optionsBack;
 
     // set some option defaults:
     options->above_alt_baro = INT32_MIN;
@@ -1314,6 +1311,8 @@ static struct char_buffer parseFetch(struct apiCon *con, struct char_buffer *req
             } else if (byteMatchStrict(option, "filter_ladd")) {
                 options->filter_dbFlag = 1;
                 options->filter_ladd = 1;
+            } else if (byteMatchStrict(option, "include_version")) {
+                con->include_version = 1;
             } else {
                 return invalid;
             }
@@ -1344,11 +1343,13 @@ static struct char_buffer parseFetch(struct apiCon *con, struct char_buffer *req
 
 
     if (options->zstd) {
-         con->content_type = "application/zstd";
+        // don't double zstd compress
+        options->zstd_encode = 0;
+        con->content_type = "application/zstd";
     } else if (options->binCraft) {
-         con->content_type = "application/octet-stream";
+        con->content_type = "application/octet-stream";
     } else {
-         con->content_type = "application/json";
+        con->content_type = "application/json";
     }
 
     return apiReq(thread, options);
@@ -1524,17 +1525,20 @@ static void apiReadRequest(struct apiCon *con, struct apiThread *thread) {
         return;
     }
 
+    struct apiOptions optionsBack = { 0 };
+    struct apiOptions *options = &optionsBack;
+
     // set end padding to zeros for byteMatchStart and byteMatch (memcmp) use without regrets
     memset(req_end, 0, end_pad);
 
     int isGET = byteMatchStart(req_start, "GET");
-    char *minor_version = protocol + litLen("HTTP/1.");
-    if (!byteMatchStart(protocol, "HTTP/1.") || !((*minor_version == '0') || (*minor_version == '1'))) {
+    char *http_minor_version = protocol + litLen("HTTP/1.");
+    if (!byteMatchStart(protocol, "HTTP/1.") || !((*http_minor_version == '0') || (*http_minor_version == '1'))) {
         send505(con->fd, con->keepalive);
         apiResetCon(con, thread);
         return;
     }
-    con->minor_version = (*minor_version == '1') ? 1 : 0;
+    con->http_minor_version = (*http_minor_version == '1') ? 1 : 0;
 
     // parseFetch expects lower cased input
     // lower case entire request
@@ -1546,10 +1550,15 @@ static void apiReadRequest(struct apiCon *con, struct apiThread *thread) {
 
     // header parsing
     char *hl = eol;
-    con->keepalive = con->minor_version == 1 ? 1 : 0;
+    con->keepalive = con->http_minor_version == 1 ? 1 : 0;
     while (hl < req_end && (eol = memchr(hl, '\n', req_end - hl))) {
         *eol = '\0';
 
+        if (byteMatchStart(hl, "accept-encoding")) {
+            if (strstr(hl, "zstd")) {
+                options->zstd_encode = 1;
+            }
+        }
         if (byteMatchStart(hl, "connection")) {
             if (strstr(hl, "close")) {
                 con->keepalive = 0;
@@ -1587,7 +1596,7 @@ static void apiReadRequest(struct apiCon *con, struct apiThread *thread) {
     }
 
     con->content_type = "multipart/mixed";
-    struct char_buffer reply = parseFetch(con, request, thread);
+    struct char_buffer reply = parseFetch(con, request, options, thread);
     if (reply.len == 0) {
         //fprintf(stderr, "parseFetch returned invalid\n");
         send400(con->fd, con->keepalive);
@@ -1606,13 +1615,17 @@ static void apiReadRequest(struct apiCon *con, struct apiThread *thread) {
 
     p = safe_snprintf(p, end,
             "HTTP/1.1 200 OK\r\n"
-            "server: readsb/3.1442\r\n"
-            "content-type: %s\r\n"
-            "connection: %s\r\n"
-            "cache-control: no-store\r\n"
-            "content-length: %d\r\n\r\n",
+            "Server: readsb/wiedehopf\r\n"
+            "%s"
+            "Content-Type: %s\r\n"
+            "Connection: %s\r\n"
+            "Cache-Control: no-store\r\n"
+            "%s"
+            "Content-Length: %d\r\n\r\n",
+            con->include_version ? "readsb_version: "MODES_READSB_VERSION"\r\n" : "",
             con->content_type,
             con->keepalive ? "keep-alive" : "close",
+            options->zstd_encode ? "Content-Encoding: zstd\r\n" : "",
             content_len);
 
     int hlen = p - header;
@@ -1855,21 +1868,48 @@ static void *apiUpdateEntryPoint(void *arg) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     struct timespec cpu_timer;
+
     while (!Modes.exit) {
 
-        //struct timespec watch;
-        //startWatch(&watch);
+        struct timespec watch;
+
+        int debug = 0;
+        if (debug) {
+            fprintTimePrecise(stderr, mstime());
+            fprintf(stderr, " apiUpdate\n");
+
+            startWatch(&watch);
+        }
 
         start_cpu_timing(&cpu_timer);
 
-        apiUpdate();
+        int ac_count = apiUpdate();
 
         end_cpu_timing(&cpu_timer, &Modes.stats_current.api_update_cpu);
 
-        //int64_t elapsed = stopWatch(&watch);
-        //fprintf(stderr, "api req took: %.5f s, got %d aircraft!\n", elapsed / 1000.0, n);
 
-        threadTimedWait(&Threads.apiUpdate, &ts, Modes.json_interval);
+        if (0 && debug) {
+            int64_t elapsed = stopWatch(&watch);
+            fprintTimePrecise(stderr, mstime());
+            fprintf(stderr, " apiUpdate took: %.3f s for %d aircraft!\n", elapsed / 1000.0, ac_count);
+        }
+
+        int64_t now = mstime();
+
+        int64_t ival = Modes.json_interval;
+        int64_t remaining = ival - (now % ival);
+
+        if (remaining < 5) {
+            remaining += ival;
+        }
+
+        int64_t waitStarted = now;
+        int64_t elapsed = 0;
+        do {
+            threadTimedWait(&Threads.apiUpdate, &ts, remaining - elapsed);
+            //fprintf(stderr, ".");
+            elapsed = mstime() - waitStarted;
+        } while (!Modes.exit && elapsed < remaining);
     }
     pthread_mutex_unlock(&Threads.apiUpdate.mutex);
     return NULL;
@@ -1991,7 +2031,7 @@ struct char_buffer apiGenerateAircraftJson(threadpool_buffer_t *pbuffer) {
 
     struct apiBuffer *buffer = &Modes.apiBuffer[flip];
 
-    ssize_t alloc = buffer->jsonLen + 2048;
+    ssize_t alloc = buffer->jsonLen + 8 * 1024;
 
     char *buf = check_grow_threadpool_buffer_t(pbuffer, alloc);
     char *p = buf;

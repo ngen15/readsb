@@ -3,7 +3,9 @@ READSB_VERSION := "$(shell echo -n `cat version`; { git show -s --format=format:
 
 RTLSDR ?= no
 BLADERF ?= no
+HACKRF ?= no
 PLUTOSDR ?= no
+SOAPYSDR ?= no
 AGGRESSIVE ?= no
 HAVE_BIASTEE ?= no
 TRACKS_UUID ?= no
@@ -12,7 +14,7 @@ PRINT_UUIDS ?= no
 DIALECT = -std=c11
 CFLAGS = $(DIALECT) -W -D_GNU_SOURCE -D_DEFAULT_SOURCE -Wall -Werror -fno-common -O2
 CFLAGS += -DMODES_READSB_VERSION=\"$(READSB_VERSION)\"
-CFLAGS += -Wdate-time -D_FORTIFY_SOURCE=2 -fstack-protector-strong -Wformat -Werror=format-security
+CFLAGS += -Wdate-time -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 -fstack-protector-strong -Wformat -Werror=format-security
 
 LIBS = -pthread -lpthread -lm -lrt -lzstd
 
@@ -26,14 +28,19 @@ ifeq ($(shell $(CC) -c feature_test.c -o feature_test.o -Wno-format-truncation -
 	CFLAGS += -Wno-format-truncation
 endif
 
-ifeq ($(shell uname -m | grep -qs -e arm >/dev/null 2>&1 && echo 1 || echo 0), 1)
+ifeq ($(shell uname -m | grep -qs -e arm -e aarch64 >/dev/null 2>&1 && echo 1 || echo 0), 1)
   CFLAGS += -DSC16Q11_TABLE_BITS=8
 endif
 
 ifeq ($(DISABLE_INTERACTIVE), yes)
   CFLAGS += -DDISABLE_INTERACTIVE
 else
-  LIBS += -lncurses
+  LIBS += $(shell pkg-config --libs ncurses)
+endif
+
+# only disable workaround if zerocopy is disabled in librtlsdr, otherwise expect significantly increased CPU use
+ifeq ($(DISABLE_RTLSDR_ZEROCOPY_WORKAROUND), yes)
+  CFLAGS += -DDISABLE_RTLSDR_ZEROCOPY_WORKAROUND
 endif
 
 ifeq ($(HISTORY), yes)
@@ -72,6 +79,10 @@ ifeq ($(PRINT_UUIDS), yes)
   CFLAGS += -DPRINT_UUIDS
 endif
 
+ifneq ($(RECENT_RECEIVER_IDS),)
+  CFLAGS += -DRECENT_RECEIVER_IDS=$(RECENT_RECEIVER_IDS)
+endif
+
 ifeq ($(RTLSDR), yes)
   SDR_OBJ += sdr_rtlsdr.o
   CFLAGS += -DENABLE_RTLSDR
@@ -101,10 +112,22 @@ ifeq ($(BLADERF), yes)
   LIBS_SDR += $(shell pkg-config --libs libbladeRF)
 endif
 
+ifeq ($(HACKRF), yes)
+  SDR_OBJ += sdr_hackrf.o
+  CFLAGS += $(shell pkg-config --cflags libhackrf) -DENABLE_HACKRF
+  LIBS_SDR += $(shell pkg-config --libs libhackrf)
+endif
+
 ifeq ($(PLUTOSDR), yes)
     SDR_OBJ += sdr_plutosdr.o
     CFLAGS += $(shell pkg-config --cflags libiio libad9361) -DENABLE_PLUTOSDR
     LIBS_SDR += $(shell pkg-config --libs libiio libad9361)
+endif
+
+ifeq ($(SOAPYSDR), yes)
+  SDR_OBJ += sdr_soapy.o
+  CFLAGS += $(shell pkg-config --cflags SoapySDR) -DENABLE_SOAPYSDR
+  LIBS_SDR += $(shell pkg-config --libs SoapySDR)
 endif
 
 # add custom overrides if user defines them

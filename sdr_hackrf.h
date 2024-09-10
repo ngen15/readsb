@@ -1,13 +1,13 @@
 // Part of readsb, a Mode-S/ADSB/TIS message decoder.
 //
-// sdr.h: generic SDR infrastructure (header)
+// sdr_hackrf.c: HackRF support
 //
-// Copyright (c) 2019 Michael Wolf <michael@mictronics.de>
+// Copyright (c) 2023 Timothy Mullican <timothy.j.mullican@gmail.com>
 //
-// This code is based on a detached fork of dump1090-fa.
+// This code is based on dump1090_sdrplus.
 //
-// Copyright (c) 2016-2017 Oliver Jowett <oliver@mutability.co.uk>
-// Copyright (c) 2017 FlightAware LLC
+// Copyright (C) 2012 by Salvatore Sanfilippo <antirez@gmail.com>
+// HackRF One support added by Ilker Temir <ilker@ilkertemir.com>
 //
 // This file is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -22,22 +22,15 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-#ifndef SDR_H
-#define SDR_H
+#ifndef HACKRF_H
+#define HACKRF_H
 
-// Common interface to different SDR inputs.
+// Support for the Great Scott Gadgets HackRF One SDR
 
-void sdrInitConfig ();
-bool sdrHandleOption (int argc, char *argv);
-bool sdrOpen ();
-void sdrRun ();
-bool sdrHasRun();
-void sdrCancel ();
-void sdrClose ();
-void sdrSetGain ();
-
-void lockReader();
-void unlockReader();
-void wakeDecode();
+void hackRFInitConfig ();
+bool hackRFHandleOption (int argc, char *argv);
+bool hackRFOpen ();
+void hackRFRun ();
+void hackRFClose ();
 
 #endif

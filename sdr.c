@@ -32,8 +32,14 @@
 #include "sdr_bladerf.h"
 #include "sdr_ubladerf.h"
 #endif
+#ifdef ENABLE_HACKRF
+#include "sdr_hackrf.h"
+#endif
 #ifdef ENABLE_PLUTOSDR
 #include "sdr_plutosdr.h"
+#endif
+#ifdef ENABLE_SOAPYSDR
+#include "sdr_soapy.h"
 #endif
 
 #include "sdr_beast.h"
@@ -50,14 +56,15 @@ typedef struct {
     const char *name;
     sdr_type_t sdr_type;
     pthread_t manageThread;
+    void (*setGain)();
 } sdr_handler;
 
 static void noInitConfig() {
 }
 
-static bool noHandleOption(int argc, char *argv) {
-    MODES_NOTUSED(argc);
-    MODES_NOTUSED(argv);
+static bool noHandleOption(int key, char *arg) {
+    MODES_NOTUSED(key);
+    MODES_NOTUSED(arg);
 
     return false;
 }
@@ -76,6 +83,9 @@ static void noCancel() {
 static void noClose() {
 }
 
+static void noSetGain() {
+}
+
 static bool unsupportedOpen() {
     fprintf(stderr, "Support for this SDR type was not enabled in this build.\n");
     return false;
@@ -83,24 +93,32 @@ static bool unsupportedOpen() {
 
 static sdr_handler sdr_handlers[] = {
 #ifdef ENABLE_RTLSDR
-    { rtlsdrInitConfig, rtlsdrHandleOption, rtlsdrOpen, rtlsdrRun, rtlsdrCancel, rtlsdrClose, "rtlsdr", SDR_RTLSDR, 0},
+    { rtlsdrInitConfig, rtlsdrHandleOption, rtlsdrOpen, rtlsdrRun, rtlsdrCancel, rtlsdrClose, "rtlsdr", SDR_RTLSDR, 0, rtlsdrSetGain},
 #endif
 
 #ifdef ENABLE_BLADERF
-    { bladeRFInitConfig, bladeRFHandleOption, bladeRFOpen, bladeRFRun, noCancel, bladeRFClose, "bladerf", SDR_BLADERF, 0},
-    { ubladeRFInitConfig, ubladeRFHandleOption, ubladeRFOpen, ubladeRFRun, noCancel, ubladeRFClose, "ubladerf", SDR_MICROBLADERF, 0},
+    { bladeRFInitConfig, bladeRFHandleOption, bladeRFOpen, bladeRFRun, noCancel, bladeRFClose, "bladerf", SDR_BLADERF, 0, noSetGain},
+    { ubladeRFInitConfig, ubladeRFHandleOption, ubladeRFOpen, ubladeRFRun, noCancel, ubladeRFClose, "ubladerf", SDR_MICROBLADERF, 0, noSetGain},
+#endif
+
+#ifdef ENABLE_HACKRF
+    { hackRFInitConfig, hackRFHandleOption, hackRFOpen, hackRFRun, noCancel, hackRFClose, "hackrf", SDR_HACKRF, 0, noSetGain},
 #endif
 
 #ifdef ENABLE_PLUTOSDR
-    { plutosdrInitConfig, plutosdrHandleOption, plutosdrOpen, plutosdrRun, noCancel, plutosdrClose, "plutosdr", SDR_PLUTOSDR, 0},
+    { plutosdrInitConfig, plutosdrHandleOption, plutosdrOpen, plutosdrRun, noCancel, plutosdrClose, "plutosdr", SDR_PLUTOSDR, 0, noSetGain},
 #endif
 
-    { beastInitConfig, beastHandleOption, beastOpen, noRun, noCancel, noClose, "modesbeast", SDR_MODESBEAST, 0},
-    { beastInitConfig, beastHandleOption, beastOpen, noRun, noCancel, noClose, "gnshulc", SDR_GNS, 0},
-    { ifileInitConfig, ifileHandleOption, ifileOpen, ifileRun, noCancel, ifileClose, "ifile", SDR_IFILE, 0},
-    { noInitConfig, noHandleOption, noOpen, noRun, noCancel, noClose, "none", SDR_NONE, 0},
+#ifdef ENABLE_SOAPYSDR
+    { soapyInitConfig, soapyHandleOption, soapyOpen, soapyRun, noCancel, soapyClose, "soapysdr", SDR_SOAPYSDR, 0 , noSetGain},
+#endif
 
-    { NULL, NULL, NULL, NULL, NULL, NULL, NULL, SDR_NONE, 0} /* must come last */
+    { beastInitConfig, beastHandleOption, beastOpen, noRun, noCancel, noClose, "modesbeast", SDR_MODESBEAST, 0, noSetGain},
+    { beastInitConfig, beastHandleOption, beastOpen, noRun, noCancel, noClose, "gnshulc", SDR_GNS, 0, noSetGain},
+    { ifileInitConfig, ifileHandleOption, ifileOpen, ifileRun, noCancel, ifileClose, "ifile", SDR_IFILE, 0, noSetGain},
+    { noInitConfig, noHandleOption, noOpen, noRun, noCancel, noClose, "none", SDR_NONE, 0, noSetGain},
+
+    { NULL, NULL, NULL, NULL, NULL, NULL, NULL, SDR_NONE, 0, NULL} /* must come last */
 };
 
 void sdrInitConfig() {
@@ -113,11 +131,11 @@ void sdrInitConfig() {
     }
 }
 
-bool sdrHandleOption(int argc, char *argv) {
-    switch (argc) {
+bool sdrHandleOption(int key, char *arg) {
+    switch (key) {
         case OptDeviceType:
             for (int i = 0; sdr_handlers[i].name; ++i) {
-                if (!strcasecmp(sdr_handlers[i].name, argv)) {
+                if (!strcasecmp(sdr_handlers[i].name, arg)) {
                     Modes.sdr_type = sdr_handlers[i].sdr_type;
                     return true;
                 }
@@ -126,12 +144,12 @@ bool sdrHandleOption(int argc, char *argv) {
         default:
             for (int i = 0; sdr_handlers[i].sdr_type; ++i) {
                 if (Modes.sdr_type == sdr_handlers[i].sdr_type) {
-                    return sdr_handlers[i].handleOption(argc, argv);
+                    return sdr_handlers[i].handleOption(key, arg);
                 }
             }
     }
 
-    fprintf(stderr, "SDR type '%s' not recognized; supported SDR types are:\n", argv);
+    fprintf(stderr, "SDR type '%s' not recognized; supported SDR types are:\n", arg);
     for (int i = 0; sdr_handlers[i].name; ++i) {
         fprintf(stderr, "  %s\n", sdr_handlers[i].name);
     }
@@ -140,7 +158,7 @@ bool sdrHandleOption(int argc, char *argv) {
 }
 
 static sdr_handler *current_handler() {
-    static sdr_handler unsupported_handler = {noInitConfig, noHandleOption, unsupportedOpen, noRun, noCancel, noClose, "unsupported", SDR_NONE, 0};
+    static sdr_handler unsupported_handler = {noInitConfig, noHandleOption, unsupportedOpen, noRun, noCancel, noClose, "unsupported", SDR_NONE, 0, noSetGain};
 
     for (int i = 0; sdr_handlers[i].name; ++i) {
         if (Modes.sdr_type == sdr_handlers[i].sdr_type) {
@@ -157,7 +175,13 @@ static sdr_handler *current_handler() {
 //
 
 bool sdrOpen() {
-    return current_handler()->open();
+    pthread_mutex_lock(&Modes.sdrControlMutex);
+    bool success = current_handler()->open();
+    pthread_mutex_unlock(&Modes.sdrControlMutex);
+    if (success) {
+        Modes.sdrInitialized = 1;
+    }
+    return success;
 }
 
 bool sdrHasRun() {
@@ -170,11 +194,31 @@ void sdrRun() {
 }
 
 void sdrCancel() {
+    pthread_mutex_lock(&Modes.sdrControlMutex);
+    Modes.sdrInitialized = 0;
+
     current_handler()->cancel();
+
+    pthread_mutex_unlock(&Modes.sdrControlMutex);
 }
 
 void sdrClose() {
+    pthread_mutex_lock(&Modes.sdrControlMutex);
+
+    Modes.sdrInitialized = 0;
     current_handler()->close();
+
+    pthread_mutex_unlock(&Modes.sdrControlMutex);
+}
+
+void sdrSetGain(){
+    pthread_mutex_lock(&Modes.sdrControlMutex);
+
+    if (Modes.sdrInitialized) {
+        current_handler()->setGain();
+    }
+
+    pthread_mutex_unlock(&Modes.sdrControlMutex);
 }
 
 void lockReader() {
